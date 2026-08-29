@@ -544,6 +544,52 @@ describe('control-kernel task packets', () => {
     }
   })
 
+  it('reserves control-kernel lifecycle claims from generic same-owner takeover after expiry', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-control-kernel-generic-same-owner-takeover-'))
+    const watchStatePath = join(root, 'state.json')
+    try {
+      const store = new FileStateStore({ batchSize: 1, watchStatePath })
+      const initial = {
+        issueId: 'issue-22',
+        taskId: 'generic-same-owner-expired-takeover',
+        inputRevision: 'bcdefabcdefabcdefabcdefabcdefabcdefabcde',
+        attemptId: 'attempt-generic-same-owner-a',
+        generation: 1,
+      }
+      expect((await store.claimControlKernelTaskPacket(
+        'control-kernel', initial, lifecycleSeed(initial.attemptId), 'owner-a', 1_000, 100,
+      )).accepted).toBe(true)
+      expect((await store.checkpointControlKernelTaskPacket(
+        'control-kernel', initial, 'owner-a', 1_001,
+      )).accepted).toBe(true)
+      const before = await readFile(watchStatePath, 'utf8')
+
+      const genericClaim = await store.claimDispatchLifecycle(
+        'control-kernel', controlKernelLifecycleKey(initial), lifecycleSeed('generic-attempt'), 'owner-a', 1_101, 100,
+      )
+
+      expect(genericClaim).toMatchObject({ acquired: false, created: false })
+      expect(await readFile(watchStatePath, 'utf8')).toBe(before)
+      await expect(store.checkpointControlKernelTaskPacket(
+        'control-kernel', initial, 'owner-a', 1_102,
+      )).resolves.toEqual({ accepted: false, reason: 'stale-owner' })
+      await expect(store.completeControlKernelTaskPacket(
+        'control-kernel', initial, 'owner-a', 1_102,
+      )).resolves.toEqual({ accepted: false, reason: 'stale-owner' })
+
+      const successor = {
+        ...initial,
+        attemptId: 'attempt-generic-same-owner-a-successor',
+        generation: 2,
+      }
+      expect(await store.claimControlKernelTaskPacket(
+        'control-kernel', successor, lifecycleSeed(successor.attemptId), 'owner-a', 1_103, 100,
+      )).toMatchObject({ accepted: true, lease: { owner: 'owner-a', epoch: 2 } })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('replays a checkpoint receipt byte-for-byte after reopening the state store', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-control-kernel-checkpoint-replay-'))
     const watchStatePath = join(root, 'state.json')

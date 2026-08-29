@@ -42,6 +42,7 @@ import {
   controlKernelOperationReceipt,
   controlKernelLifecycleKey,
   controlKernelTaskPacketKey,
+  isControlKernelLifecycleKey,
   isControlKernelTaskPacket,
   publicControlKernelTaskPacketState,
   type ControlKernelTaskPacket,
@@ -449,6 +450,9 @@ export class DocumentStateStore extends InMemoryStateStore {
     nowMs: number,
     leaseMs: number,
   ): Promise<DispatchLifecycleClaim> {
+    if (isControlKernelLifecycleKey(key)) {
+      return { acquired: false, lifecycle: cloneLifecycle(seed), created: false }
+    }
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
@@ -495,6 +499,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     nowMs: number,
     leaseMs: number,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const lifecycle = document.workspaces[workspaceId]?.dispatchLifecycles[key]
@@ -521,6 +526,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     epoch: number,
     nowMs: number,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
@@ -547,6 +553,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     owner: string,
     epoch: number,
   ): Promise<void> {
+    if (isControlKernelLifecycleKey(key)) return
     await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const lease = document.workspaces[workspaceId]?.dispatchLifecycles[key]?.lease
@@ -564,6 +571,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     nowMs: number,
     lifecycle: DispatchLifecycle,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
@@ -603,6 +611,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     key: string,
     expectedLease: DispatchLifecycle['lease'],
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
@@ -623,6 +632,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     key: string,
     expectedLease: NonNullable<DispatchLifecycle['lease']>,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
@@ -639,6 +649,7 @@ export class DocumentStateStore extends InMemoryStateStore {
   }
 
   override async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
+    if (isControlKernelLifecycleKey(key)) return
     await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]

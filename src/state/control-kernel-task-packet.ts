@@ -79,6 +79,8 @@ export const controlKernelTaskPacketKey = (packet: Pick<ControlKernelTaskPacket,
 export const controlKernelLifecycleKey = (packet: Pick<ControlKernelTaskPacket, 'issueId' | 'taskId'>): string =>
   `control-kernel:${controlKernelTaskPacketKey(packet)}`
 
+export const isControlKernelLifecycleKey = (key: string): boolean => key.startsWith('control-kernel:')
+
 export const publicControlKernelTaskPacketState = (
   state: ControlKernelTaskPacketState,
 ): Omit<ControlKernelTaskPacketState, 'lifecycleKey'> => {
