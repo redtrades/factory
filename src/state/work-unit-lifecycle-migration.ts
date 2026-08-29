@@ -1,6 +1,7 @@
 import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
 import type { DispatchLifecycle } from '../ports/state'
 import type { IssueRef } from '../types'
+import { isControlKernelLifecycleKey } from './control-kernel-task-packet'
 
 /**
  * Dispatch claims used to be keyed on `${key}:${uuid}:${path}` — the Relayfile
@@ -72,6 +73,7 @@ export const planLifecycleMigration = (
   seed: Pick<DispatchLifecycle, 'issue'>,
   nowMs: number,
 ): LifecycleMigration => {
+  if (isControlKernelLifecycleKey(canonicalKey)) return { outcome: 'canonical', aliases: [] }
   const surfaceKey = surfaceLifecycleKeyOrUndefined(seed.issue)
   const legacyKeys = new Set([
     legacyCompositeLifecycleKey(seed.issue),
@@ -82,6 +84,11 @@ export const planLifecycleMigration = (
   let canonical: DispatchLifecycle | undefined
   const candidates: Array<[string, DispatchLifecycle]> = []
   for (const [key, lifecycle] of entries) {
+    // Control-kernel task packets bind this lifecycle key to an immutable
+    // packet/attempt record. Generic dispatch migration has no authority to
+    // move or alias that row, even when its IssueRef resolves to a generic
+    // provider identity.
+    if (isControlKernelLifecycleKey(key)) continue
     if (key === canonicalKey) {
       canonical = lifecycle
       continue
@@ -260,6 +267,7 @@ export const migrateDispatchLifecycleKeys = (
 ): boolean => {
   const groups = new Map<string, Array<[string, DispatchLifecycle]>>()
   for (const [key, lifecycle] of read()) {
+    if (isControlKernelLifecycleKey(key)) continue
     if (isMigrationAlias(lifecycle)) continue
     const canonicalKey = identityOf(lifecycle)
     if (!canonicalKey) continue

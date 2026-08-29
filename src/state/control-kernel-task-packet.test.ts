@@ -41,6 +41,18 @@ const lifecycleSeed = (attemptId: string): DispatchLifecycle => ({
   updatedAtMs: 0,
 })
 
+const linearLifecycleSeed = (attemptId: string): DispatchLifecycle => {
+  const seed = lifecycleSeed(attemptId)
+  return {
+    ...seed,
+    issue: { ...seed.issue, key: 'CONTROL-22' },
+    decision: {
+      ...seed.decision,
+      issue: { ...seed.decision.issue, key: 'CONTROL-22' },
+    },
+  }
+}
+
 describe('control-kernel task packets', () => {
   it('rejects a malformed input revision before admitting a task packet', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-control-kernel-invalid-input-'))
@@ -584,6 +596,57 @@ describe('control-kernel task packets', () => {
       }
       expect(await store.claimControlKernelTaskPacket(
         'control-kernel', successor, lifecycleSeed(successor.attemptId), 'owner-a', 1_103, 100,
+      )).toMatchObject({ accepted: true, lease: { owner: 'owner-a', epoch: 2 } })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('prevents generic lifecycle migration from adopting a control-kernel packet row', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-control-kernel-generic-migration-takeover-'))
+    const watchStatePath = join(root, 'state.json')
+    try {
+      const store = new FileStateStore({ batchSize: 1, watchStatePath })
+      const initial = {
+        issueId: 'issue-22',
+        taskId: 'generic-migration-expired-takeover',
+        inputRevision: 'cdefabcdefabcdefabcdefabcdefabcdefabcdef',
+        attemptId: 'attempt-generic-migration-a',
+        generation: 1,
+      }
+      expect((await store.claimControlKernelTaskPacket(
+        'control-kernel', initial, linearLifecycleSeed(initial.attemptId), 'owner-a', 1_000, 100,
+      )).accepted).toBe(true)
+      expect((await store.checkpointControlKernelTaskPacket(
+        'control-kernel', initial, 'owner-a', 1_001,
+      )).accepted).toBe(true)
+
+      await store.claimDispatchLifecycle(
+        'control-kernel', 'linear:control-kernel:issue-22', linearLifecycleSeed('generic-migration-attempt'), 'owner-a', 1_101, 100,
+      )
+
+      expect(await store.getDispatchLifecycle(
+        'control-kernel', controlKernelLifecycleKey(initial),
+      )).toMatchObject({
+        lease: { owner: 'owner-a', epoch: 1, leaseUntilMs: 1_100 },
+      })
+      expect(await store.getControlKernelTaskPacket(
+        'control-kernel', initial.issueId, initial.taskId,
+      )).toMatchObject({ phase: 'checkpointed' })
+      await expect(store.checkpointControlKernelTaskPacket(
+        'control-kernel', initial, 'owner-a', 1_102,
+      )).resolves.toEqual({ accepted: false, reason: 'stale-owner' })
+      await expect(store.completeControlKernelTaskPacket(
+        'control-kernel', initial, 'owner-a', 1_102,
+      )).resolves.toEqual({ accepted: false, reason: 'stale-owner' })
+
+      const successor = {
+        ...initial,
+        attemptId: 'attempt-generic-migration-a-successor',
+        generation: 2,
+      }
+      expect(await store.claimControlKernelTaskPacket(
+        'control-kernel', successor, linearLifecycleSeed(successor.attemptId), 'owner-a', 1_103, 100,
       )).toMatchObject({ accepted: true, lease: { owner: 'owner-a', epoch: 2 } })
     } finally {
       await rm(root, { recursive: true, force: true })
