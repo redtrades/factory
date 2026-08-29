@@ -132,6 +132,7 @@ const validateControlKernelTaskPacketBindings = (
         !sameControlKernelTaskPacket(attempt.packet, task) ||
         attempt.lifecycleKey !== task.lifecycleKey ||
         !lifecycle?.lease ||
+        lifecycle.migrationAliasOf !== undefined ||
         lifecycle.lease.owner !== attempt.owner ||
         lifecycle.lease.epoch !== task.generation ||
         !controlKernelPhaseMatchesReceipts(task, attempt) ||

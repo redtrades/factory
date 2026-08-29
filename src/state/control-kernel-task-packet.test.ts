@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 import type { DispatchLifecycle } from '../ports/state'
 import { controlKernelLifecycleKey } from './control-kernel-task-packet'
 import { FileStateStore } from './file-state-store'
+import { prunableMigrationAliases } from './work-unit-lifecycle-migration'
 
 const lifecycleSeed = (attemptId: string): DispatchLifecycle => ({
   runId: attemptId,
@@ -53,6 +54,11 @@ const linearLifecycleSeed = (attemptId: string): DispatchLifecycle => {
   }
 }
 
+const aliasedLifecycleSeed = (attemptId: string): DispatchLifecycle => ({
+  ...lifecycleSeed(attemptId),
+  migrationAliasOf: 'linear:retired-control-kernel-packet',
+})
+
 describe('control-kernel task packets', () => {
   it('rejects a malformed input revision before admitting a task packet', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-control-kernel-invalid-input-'))
@@ -72,6 +78,28 @@ describe('control-kernel task packets', () => {
       )
 
       expect(result).toEqual({ accepted: false, reason: 'invalid-input-revision' })
+      await expect(readFile(watchStatePath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects task packet admission with migration alias seed metadata', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-control-kernel-alias-seed-'))
+    const watchStatePath = join(root, 'state.json')
+    try {
+      const packet = {
+        issueId: 'issue-22',
+        taskId: 'alias-seed-admission',
+        inputRevision: '1234567890abcdef1234567890abcdef12345678',
+        attemptId: 'attempt-alias-seed',
+        generation: 1,
+      }
+      const store = new FileStateStore({ batchSize: 1, watchStatePath })
+
+      expect(await store.claimControlKernelTaskPacket(
+        'control-kernel', packet, aliasedLifecycleSeed(packet.attemptId), 'owner-a', 1_000, 100,
+      )).toEqual({ accepted: false, reason: 'migration-alias-seed' })
       await expect(readFile(watchStatePath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -470,6 +498,39 @@ describe('control-kernel task packets', () => {
     }
   })
 
+  it('fails closed on migration alias metadata in a persisted control-kernel lifecycle', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-control-kernel-alias-restart-'))
+    const watchStatePath = join(root, 'state.json')
+    try {
+      const packet = {
+        issueId: 'issue-22',
+        taskId: 'alias-restart-binding',
+        inputRevision: '2468ace02468ace02468ace02468ace02468ace0',
+        attemptId: 'attempt-alias-restart',
+        generation: 1,
+      }
+      const store = new FileStateStore({ batchSize: 1, watchStatePath })
+      expect((await store.claimControlKernelTaskPacket(
+        'control-kernel', packet, lifecycleSeed(packet.attemptId), 'owner-a', 1_000, 100,
+      )).accepted).toBe(true)
+      expect((await store.checkpointControlKernelTaskPacket(
+        'control-kernel', packet, 'owner-a', 1_001,
+      )).accepted).toBe(true)
+      const document = JSON.parse(await readFile(watchStatePath, 'utf8'))
+      document.workspaces['control-kernel'].dispatchLifecycles[
+        controlKernelLifecycleKey(packet)
+      ].migrationAliasOf = 'linear:forged-control-kernel-packet'
+      await writeFile(watchStatePath, JSON.stringify(document), 'utf8')
+      const corruptedBytes = await readFile(watchStatePath, 'utf8')
+      const reopened = new FileStateStore({ batchSize: 1, watchStatePath })
+
+      await expect(reopened.assertReady()).rejects.toThrow('Factory GitHub watch state file is invalid')
+      expect(await readFile(watchStatePath, 'utf8')).toBe(corruptedBytes)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('increments generation after expiry and fences the prior owner from checkpoint and completion', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-control-kernel-takeover-'))
     const watchStatePath = join(root, 'state.json')
@@ -651,6 +712,21 @@ describe('control-kernel task packets', () => {
     } finally {
       await rm(root, { recursive: true, force: true })
     }
+  })
+
+  it('keeps control-kernel keys non-prunable when they carry migration alias metadata', () => {
+    const packet = {
+      issueId: 'issue-22',
+      taskId: 'generic-pruning-expired-takeover',
+      inputRevision: 'defabcdefabcdefabcdefabcdefabcdefabcdefa',
+      attemptId: 'attempt-generic-pruning-a',
+      generation: 1,
+    }
+    const lifecycle = aliasedLifecycleSeed(packet.attemptId)
+
+    expect(prunableMigrationAliases([
+      [controlKernelLifecycleKey(packet), lifecycle],
+    ], 1_101)).not.toContain(controlKernelLifecycleKey(packet))
   })
 
   it('replays a checkpoint receipt byte-for-byte after reopening the state store', async () => {

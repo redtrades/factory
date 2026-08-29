@@ -190,7 +190,10 @@ export const prunableMigrationAliases = (
   }
 
   const oldestFirst = all
-    .filter(([, lifecycle]) => isMigrationAlias(lifecycle))
+    // A task-packet row may retain legacy migration metadata, but its
+    // control-kernel key remains authoritative and is never generic pruning
+    // evidence.
+    .filter(([key, lifecycle]) => !isControlKernelLifecycleKey(key) && isMigrationAlias(lifecycle))
     .sort(([leftKey, left], [rightKey, right]) =>
       (left.updatedAtMs ?? 0) - (right.updatedAtMs ?? 0) || leftKey.localeCompare(rightKey))
 

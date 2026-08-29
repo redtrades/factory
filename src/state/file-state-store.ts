@@ -119,6 +119,9 @@ export class DocumentStateStore extends InMemoryStateStore {
     if (seed.runId !== packet.attemptId) {
       return { accepted: false, reason: 'seed-attempt-mismatch' }
     }
+    if (seed.migrationAliasOf !== undefined) {
+      return { accepted: false, reason: 'migration-alias-seed' }
+    }
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()

@@ -39,6 +39,7 @@ export type ControlKernelTaskPacketClaim =
       | 'invalid-input-revision'
       | 'invalid-task-packet'
       | 'seed-attempt-mismatch'
+      | 'migration-alias-seed'
       | 'generation-conflict'
       | 'lease-held'
       | 'terminal'
