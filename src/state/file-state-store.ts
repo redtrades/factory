@@ -37,6 +37,19 @@ import type {
   WatchStateDocumentStore,
 } from './document-store'
 import { emptyDiscoverySweepState, parseWatchStateDocument } from './watch-state-document'
+import {
+  controlKernelClaimReceipt,
+  controlKernelOperationReceipt,
+  controlKernelLifecycleKey,
+  controlKernelTaskPacketKey,
+  isControlKernelLifecycleKey,
+  isControlKernelTaskPacket,
+  publicControlKernelTaskPacketState,
+  type ControlKernelTaskPacket,
+  type ControlKernelTaskPacketClaim,
+  type ControlKernelTaskPacketOperation,
+  type ControlKernelTaskPacketState,
+} from './control-kernel-task-packet'
 
 export type FileStateStoreOptions = InMemoryStateStoreOptions & {
   watchStatePath: string
@@ -87,6 +100,204 @@ export class DocumentStateStore extends InMemoryStateStore {
 
   async assertReady(): Promise<void> {
     await this.#exclusive(async () => this.#documentStore.assertReady())
+  }
+
+  async claimControlKernelTaskPacket(
+    workspaceId: string,
+    packet: unknown,
+    seed: DispatchLifecycle,
+    owner: string,
+    nowMs: number,
+    leaseMs: number,
+  ): Promise<ControlKernelTaskPacketClaim> {
+    if (!isControlKernelTaskPacket(packet)) {
+      if (!isRecord(packet) || typeof packet.inputRevision !== 'string' || !/^[0-9a-f]{40}$/u.test(packet.inputRevision)) {
+        return { accepted: false, reason: 'invalid-input-revision' }
+      }
+      return { accepted: false, reason: 'invalid-task-packet' }
+    }
+    if (seed.runId !== packet.attemptId) {
+      return { accepted: false, reason: 'seed-attempt-mismatch' }
+    }
+    if (seed.migrationAliasOf !== undefined) {
+      return { accepted: false, reason: 'migration-alias-seed' }
+    }
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+      const taskKey = controlKernelTaskPacketKey(packet)
+      const lifecycleKey = controlKernelLifecycleKey(packet)
+      const taskPackets = workspace.controlKernelTaskPackets ??= {}
+      const attempts = document.controlKernelTaskPacketAttempts ??= {}
+      const existingTask = taskPackets[taskKey]
+      if (existingTask && existingTask.inputRevision !== packet.inputRevision) {
+        return { accepted: false, reason: 'input-revision-conflict' }
+      }
+      let lifecycle = workspace.dispatchLifecycles[lifecycleKey]
+      if (
+        existingTask &&
+        existingTask.attemptId !== packet.attemptId &&
+        lifecycle?.lease && lifecycle.lease.leaseUntilMs > nowMs
+      ) return { accepted: false, reason: 'attempt-id-conflict' }
+      const existingAttempt = attempts[packet.attemptId]
+      if (existingAttempt) {
+        const samePacket = existingAttempt.packet.issueId === packet.issueId &&
+          existingAttempt.packet.taskId === packet.taskId &&
+          existingAttempt.packet.inputRevision === packet.inputRevision &&
+          existingAttempt.packet.generation === packet.generation
+        const lease = lifecycle?.lease
+        if (
+          samePacket &&
+          existingTask?.attemptId === packet.attemptId &&
+          existingAttempt.owner === owner &&
+          existingAttempt.lifecycleKey === lifecycleKey &&
+          lease?.owner === owner &&
+          lease.epoch === packet.generation &&
+          lease.leaseUntilMs > nowMs
+        ) {
+          return { accepted: true, replayed: true, receipt: existingAttempt.receipts.claim, lease: { ...lease } }
+        }
+        return { accepted: false, reason: 'attempt-id-conflict' }
+      }
+
+      if (!lifecycle) {
+        lifecycle = cloneLifecycle(seed)
+        if (activeDispatchLifecycleCount(workspace.dispatchLifecycles) >= this.#batchSize) lifecycle.phase = 'queued'
+        workspace.dispatchLifecycles[lifecycleKey] = lifecycle
+      }
+      const terminal = lifecycle.phase === 'complete' || lifecycle.phase === 'abandoned'
+      const activeOtherOwner = lifecycle.lease && lifecycle.lease.owner !== owner && lifecycle.lease.leaseUntilMs > nowMs
+      if (terminal) return { accepted: false, reason: 'terminal' }
+      if (activeOtherOwner) return { accepted: false, reason: 'lease-held' }
+      // Existing attempts return above. Every remaining admission is a new
+      // attempt, so its generation advances from the persisted fence even if
+      // its owner string happens to be the same as the expired owner.
+      const epoch = (lifecycle.lease?.epoch ?? 0) + 1
+      if (packet.generation !== epoch) return { accepted: false, reason: 'generation-conflict' }
+
+      lifecycle.lease = { owner, epoch, leaseUntilMs: nowMs + leaseMs }
+      lifecycle.updatedAtMs = nowMs
+      stampDispatchLifecycleSlot(lifecycle, lifecycle, nowMs)
+      const lease = { ...lifecycle.lease }
+      const state: ControlKernelTaskPacketState = {
+        ...packet,
+        phase: 'claimed',
+        lifecycleKey,
+      }
+      taskPackets[taskKey] = state
+      const receipt = controlKernelClaimReceipt(packet, owner, lease)
+      attempts[packet.attemptId] = {
+        packet: structuredClone(packet),
+        owner,
+        lifecycleKey,
+        receipts: { claim: receipt },
+      }
+      await this.#persist(document)
+      return { accepted: true, replayed: false, receipt, lease }
+    }))
+  }
+
+  async getControlKernelTaskPacket(
+    workspaceId: string,
+    issueId: string,
+    taskId: string,
+  ): Promise<Omit<ControlKernelTaskPacketState, 'lifecycleKey'> | undefined> {
+    return await this.#exclusive(async () => {
+      const state = (await this.#loadFromDisk()).workspaces[workspaceId]?.controlKernelTaskPackets?.[
+        controlKernelTaskPacketKey({ issueId, taskId })
+      ]
+      return state ? publicControlKernelTaskPacketState(state) : undefined
+    })
+  }
+
+  async checkpointControlKernelTaskPacket(
+    workspaceId: string,
+    packet: unknown,
+    owner: string,
+    nowMs: number,
+  ): Promise<ControlKernelTaskPacketOperation> {
+    if (!isControlKernelTaskPacket(packet)) {
+      if (!isRecord(packet) || typeof packet.inputRevision !== 'string' || !/^[0-9a-f]{40}$/u.test(packet.inputRevision)) {
+        return { accepted: false, reason: 'invalid-input-revision' }
+      }
+      return { accepted: false, reason: 'invalid-task-packet' }
+    }
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId]
+      const task = workspace?.controlKernelTaskPackets?.[controlKernelTaskPacketKey(packet)]
+      const attempt = document.controlKernelTaskPacketAttempts?.[packet.attemptId]
+      const lifecycle = task && workspace?.dispatchLifecycles[task.lifecycleKey]
+      if (
+        (task !== undefined && task.inputRevision !== packet.inputRevision) ||
+        (attempt !== undefined && attempt.packet.inputRevision !== packet.inputRevision)
+      ) return { accepted: false, reason: 'input-revision-conflict' }
+      if (
+        task?.attemptId !== packet.attemptId ||
+        task.generation !== packet.generation ||
+        attempt?.owner !== owner ||
+        attempt.lifecycleKey !== task.lifecycleKey ||
+        lifecycle?.lease?.owner !== owner ||
+        lifecycle.lease.epoch !== packet.generation ||
+        lifecycle.lease.leaseUntilMs <= nowMs
+      ) return { accepted: false, reason: 'stale-owner' }
+      if (task.phase === 'complete') return { accepted: false, reason: 'illegal-transition' }
+      if (attempt.receipts.checkpoint) {
+        return { accepted: true, replayed: true, receipt: attempt.receipts.checkpoint }
+      }
+      if (task.phase !== 'claimed') return { accepted: false, reason: 'illegal-transition' }
+      const receipt = controlKernelOperationReceipt('checkpoint', packet, owner, lifecycle.lease)
+      task.phase = 'checkpointed'
+      lifecycle.updatedAtMs = nowMs
+      attempt.receipts.checkpoint = receipt
+      await this.#persist(document)
+      return { accepted: true, replayed: false, receipt }
+    }))
+  }
+
+  async completeControlKernelTaskPacket(
+    workspaceId: string,
+    packet: unknown,
+    owner: string,
+    nowMs: number,
+  ): Promise<ControlKernelTaskPacketOperation> {
+    if (!isControlKernelTaskPacket(packet)) {
+      if (!isRecord(packet) || typeof packet.inputRevision !== 'string' || !/^[0-9a-f]{40}$/u.test(packet.inputRevision)) {
+        return { accepted: false, reason: 'invalid-input-revision' }
+      }
+      return { accepted: false, reason: 'invalid-task-packet' }
+    }
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId]
+      const task = workspace?.controlKernelTaskPackets?.[controlKernelTaskPacketKey(packet)]
+      const attempt = document.controlKernelTaskPacketAttempts?.[packet.attemptId]
+      const lifecycle = task && workspace?.dispatchLifecycles[task.lifecycleKey]
+      if (
+        (task !== undefined && task.inputRevision !== packet.inputRevision) ||
+        (attempt !== undefined && attempt.packet.inputRevision !== packet.inputRevision)
+      ) return { accepted: false, reason: 'input-revision-conflict' }
+      if (
+        task?.attemptId !== packet.attemptId ||
+        task.generation !== packet.generation ||
+        attempt?.owner !== owner ||
+        attempt.lifecycleKey !== task.lifecycleKey ||
+        lifecycle?.lease?.owner !== owner ||
+        lifecycle.lease.epoch !== packet.generation ||
+        lifecycle.lease.leaseUntilMs <= nowMs
+      ) return { accepted: false, reason: 'stale-owner' }
+      if (task.phase === 'complete' && attempt.receipts.complete) {
+        return { accepted: true, replayed: true, receipt: attempt.receipts.complete }
+      }
+      if (task.phase !== 'checkpointed') return { accepted: false, reason: 'illegal-transition' }
+      const receipt = controlKernelOperationReceipt('complete', packet, owner, lifecycle.lease)
+      task.phase = 'complete'
+      lifecycle.phase = 'complete'
+      lifecycle.updatedAtMs = nowMs
+      attempt.receipts.complete = receipt
+      await this.#persist(document)
+      return { accepted: true, replayed: false, receipt }
+    }))
   }
 
   override async claimDiscoverySweep(
@@ -242,6 +453,9 @@ export class DocumentStateStore extends InMemoryStateStore {
     nowMs: number,
     leaseMs: number,
   ): Promise<DispatchLifecycleClaim> {
+    if (isControlKernelLifecycleKey(key)) {
+      return { acquired: false, lifecycle: cloneLifecycle(seed), created: false }
+    }
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
@@ -288,6 +502,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     nowMs: number,
     leaseMs: number,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const lifecycle = document.workspaces[workspaceId]?.dispatchLifecycles[key]
@@ -314,6 +529,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     epoch: number,
     nowMs: number,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
@@ -340,6 +556,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     owner: string,
     epoch: number,
   ): Promise<void> {
+    if (isControlKernelLifecycleKey(key)) return
     await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const lease = document.workspaces[workspaceId]?.dispatchLifecycles[key]?.lease
@@ -357,6 +574,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     nowMs: number,
     lifecycle: DispatchLifecycle,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
@@ -396,6 +614,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     key: string,
     expectedLease: DispatchLifecycle['lease'],
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
@@ -403,6 +622,7 @@ export class DocumentStateStore extends InMemoryStateStore {
       if (lifecycle?.phase !== 'queued' || !dispatchLifecycleLeaseMatches(lifecycle.lease, expectedLease)) {
         return false
       }
+      if (workspaceHasControlKernelTaskPacketLifecycle(workspace!, key)) return false
       delete workspace!.dispatchLifecycles[key]
       if (workspaceIsEmpty(workspace!)) delete document.workspaces[workspaceId]
       await this.#persist(document)
@@ -415,6 +635,7 @@ export class DocumentStateStore extends InMemoryStateStore {
     key: string,
     expectedLease: NonNullable<DispatchLifecycle['lease']>,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     return await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
@@ -422,6 +643,7 @@ export class DocumentStateStore extends InMemoryStateStore {
       if (!workspace || !lifecycle || !dispatchLifecycleLeaseMatches(lifecycle.lease, expectedLease)) {
         return false
       }
+      if (workspaceHasControlKernelTaskPacketLifecycle(workspace, key)) return false
       delete workspace.dispatchLifecycles[key]
       if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
       await this.#persist(document)
@@ -430,10 +652,12 @@ export class DocumentStateStore extends InMemoryStateStore {
   }
 
   override async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
+    if (isControlKernelLifecycleKey(key)) return
     await this.#exclusive(async () => this.#withMutationLock(async () => {
       const document = await this.#loadFromDisk()
       const workspace = document.workspaces[workspaceId]
       if (!workspace || !(key in workspace.dispatchLifecycles)) return
+      if (workspaceHasControlKernelTaskPacketLifecycle(workspace, key)) return
       delete workspace.dispatchLifecycles[key]
       if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
       await this.#persist(document)
@@ -1454,7 +1678,10 @@ const activeDispatchLifecycleCount = (lifecycles: Record<string, DispatchLifecyc
 const migrateWorkspaceLifecycleKeys = (
   lifecycles: Record<string, DispatchLifecycle>,
 ): boolean => migrateDispatchLifecycleKeys(
-  () => Object.entries(lifecycles),
+  // The bounded conformance namespace binds its own packet identity to the
+  // lifecycle row, rather than a provider-issued IssueRef identity. It is not
+  // a pre-#211 lifecycle alias and therefore must not be rekeyed on reopen.
+  () => Object.entries(lifecycles).filter(([key]) => !key.startsWith('control-kernel:')),
   (from, to) => {
     lifecycles[to] = lifecycles[from]!
     delete lifecycles[from]
@@ -1510,11 +1737,19 @@ const workspaceIsEmpty = (workspace: PersistedWorkspaceState): boolean =>
   Object.keys(workspace.babysitterGenerations).length === 0 &&
   Object.keys(workspace.conversationSessions).length === 0 &&
   Object.keys(workspace.dispatchLifecycles).length === 0 &&
+  Object.keys(workspace.controlKernelTaskPackets ?? {}).length === 0 &&
   workspace.discoverySweep.checkpoint === undefined &&
   workspace.discoverySweep.lease === undefined &&
   workspace.discoverySweep.backoffUntilMs <= 0 &&
   workspace.discoverySweep.consecutiveOverloads <= 0 &&
   workspace.discoverySweep.lastEpoch <= 0
+
+const workspaceHasControlKernelTaskPacketLifecycle = (
+  workspace: PersistedWorkspaceState,
+  lifecycleKey: string,
+): boolean => Object.values(workspace.controlKernelTaskPackets ?? {}).some(
+  (packet) => packet.lifecycleKey === lifecycleKey,
+)
 
 const syncParentDirectory = async (filePath: string): Promise<void> => {
   const handle = await open(dirname(filePath), 'r')

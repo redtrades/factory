@@ -31,6 +31,7 @@ import {
   prunableMigrationAliases,
 } from './work-unit-lifecycle-migration'
 import { dispatchLifecycleOccupiesSlot, stampDispatchLifecycleSlot } from './dispatch-lifecycle-slot'
+import { isControlKernelLifecycleKey } from './control-kernel-task-packet'
 
 type WorkspaceState = {
   batch: BatchTracker
@@ -210,6 +211,9 @@ export class InMemoryStateStore implements StateStore {
     nowMs: number,
     leaseMs: number,
   ): Promise<DispatchLifecycleClaim> {
+    if (isControlKernelLifecycleKey(key)) {
+      return { acquired: false, lifecycle: cloneDispatchLifecycle(seed), created: false }
+    }
     const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
     // Adopt any row written under a pre-#211 key before deciding no claim
     // exists, so a deploy does not create a second claim for live work.
@@ -250,6 +254,7 @@ export class InMemoryStateStore implements StateStore {
     nowMs: number,
     leaseMs: number,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     const lifecycle = this.#workspace(workspaceId).dispatchLifecycles.get(key)
     // Expiry is part of the fence. See StateStore#renewDispatchLifecycle: a
     // relinquished lease keeps its owner and epoch, so without this a handback
@@ -272,6 +277,7 @@ export class InMemoryStateStore implements StateStore {
     epoch: number,
     nowMs: number,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
     const lifecycle = lifecycles.get(key)
     if (
@@ -289,6 +295,7 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async releaseDispatchLifecycleLease(workspaceId: string, key: string, owner: string, epoch: number): Promise<void> {
+    if (isControlKernelLifecycleKey(key)) return
     const lease = this.#workspace(workspaceId).dispatchLifecycles.get(key)?.lease
     if (lease?.owner !== owner || lease.epoch !== epoch) return
     lease.leaseUntilMs = Number.MIN_SAFE_INTEGER
@@ -302,6 +309,7 @@ export class InMemoryStateStore implements StateStore {
     nowMs: number,
     lifecycle: DispatchLifecycle,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     const current = this.#workspace(workspaceId).dispatchLifecycles.get(key)
     if (!current?.lease || current.lease.owner !== owner || current.lease.epoch !== epoch || current.lease.leaseUntilMs <= nowMs) {
       return false
@@ -334,6 +342,7 @@ export class InMemoryStateStore implements StateStore {
     key: string,
     expectedLease: DispatchLifecycle['lease'],
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
     const lifecycle = lifecycles.get(key)
     if (lifecycle?.phase !== 'queued' || !dispatchLifecycleLeaseMatches(lifecycle.lease, expectedLease)) {
@@ -348,6 +357,7 @@ export class InMemoryStateStore implements StateStore {
     key: string,
     expectedLease: NonNullable<DispatchLifecycle['lease']>,
   ): Promise<boolean> {
+    if (isControlKernelLifecycleKey(key)) return false
     const lifecycles = this.#workspace(workspaceId).dispatchLifecycles
     const lifecycle = lifecycles.get(key)
     if (!lifecycle || !dispatchLifecycleLeaseMatches(lifecycle.lease, expectedLease)) return false
@@ -356,6 +366,7 @@ export class InMemoryStateStore implements StateStore {
   }
 
   async clearDispatchLifecycle(workspaceId: string, key: string): Promise<void> {
+    if (isControlKernelLifecycleKey(key)) return
     this.#workspace(workspaceId).dispatchLifecycles.delete(key)
   }
 

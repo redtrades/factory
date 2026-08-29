@@ -8,6 +8,10 @@ import type {
   SlackThreadWatchState,
   WaitingClarification,
 } from '../ports/state'
+import type {
+  ControlKernelTaskPacketAttempt,
+  ControlKernelTaskPacketState,
+} from './control-kernel-task-packet'
 
 export type PersistedWorkspaceState = {
   githubIssueCommentWatches: Record<string, GithubIssueCommentWatchState>
@@ -18,11 +22,15 @@ export type PersistedWorkspaceState = {
   conversationSessions: Record<string, ConversationSessionState>
   dispatchLifecycles: Record<string, DispatchLifecycle>
   discoverySweep: DiscoverySweepState
+  /** Present only for the bounded conformance packet authority. */
+  controlKernelTaskPackets?: Record<string, ControlKernelTaskPacketState>
 }
 
 export type WatchStateDocument = {
   version: 3
   workspaces: Record<string, PersistedWorkspaceState>
+  /** Global attempt-ID index owned by the same native mutation transaction. */
+  controlKernelTaskPacketAttempts?: Record<string, ControlKernelTaskPacketAttempt>
 }
 
 /**

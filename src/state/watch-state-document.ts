@@ -14,6 +14,13 @@ import type { AgentSpec, SpawnResult } from '../ports/fleet'
 import type { TrackedAgent } from '../orchestrator/batch-tracker'
 import type { TriageDecision } from '../types'
 import type { PersistedWorkspaceState, WatchStateDocument } from './document-store'
+import {
+  parseControlKernelTaskPacketAttempts,
+  parseControlKernelTaskPacketStates,
+  type ControlKernelTaskPacket,
+  type ControlKernelTaskPacketAttempt,
+  type ControlKernelTaskPacketState,
+} from './control-kernel-task-packet'
 
 export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
   if (!isRecord(value) || !isRecord(value.workspaces)) {
@@ -21,6 +28,8 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
   }
   if (value.version === 3) {
     const workspaces: Record<string, PersistedWorkspaceState> = {}
+    const attemptBindings = value.controlKernelTaskPacketAttempts
+    if (attemptBindings !== undefined && !isRecord(attemptBindings)) throw invalidDocument()
     for (const [workspaceId, rawWorkspace] of Object.entries(value.workspaces)) {
       if (!isRecord(rawWorkspace)) throw invalidDocument()
       const watches = rawWorkspace.githubIssueCommentWatches
@@ -31,6 +40,7 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
       const conversations = rawWorkspace.conversationSessions
       const lifecycles = rawWorkspace.dispatchLifecycles
       const discoverySweep = rawWorkspace.discoverySweep
+      const taskPackets = rawWorkspace.controlKernelTaskPackets
       if (
         !isRecord(watches) ||
         (slackWatches !== undefined && !isRecord(slackWatches)) ||
@@ -39,7 +49,8 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
         (generations !== undefined && !isRecord(generations)) ||
         (conversations !== undefined && !isRecord(conversations)) ||
         (lifecycles !== undefined && !isRecord(lifecycles)) ||
-        (discoverySweep !== undefined && !isRecord(discoverySweep))
+        (discoverySweep !== undefined && !isRecord(discoverySweep)) ||
+        (taskPackets !== undefined && !isRecord(taskPackets))
       ) throw invalidDocument()
       workspaces[workspaceId] = {
         githubIssueCommentWatches: parseGithubIssueCommentWatches(watches),
@@ -50,9 +61,18 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
         conversationSessions: parseConversationSessions(conversations ?? {}),
         dispatchLifecycles: parseDispatchLifecycles(lifecycles ?? {}),
         discoverySweep: parseDiscoverySweepState(discoverySweep),
+        ...(taskPackets === undefined ? {} : { controlKernelTaskPackets: parseControlKernelTaskPacketStates(taskPackets) }),
       }
     }
-    return { version: 3, workspaces }
+    const controlKernelTaskPacketAttempts = attemptBindings === undefined
+      ? undefined
+      : parseControlKernelTaskPacketAttempts(attemptBindings)
+    validateControlKernelTaskPacketBindings(workspaces, controlKernelTaskPacketAttempts)
+    return {
+      version: 3,
+      workspaces,
+      ...(controlKernelTaskPacketAttempts === undefined ? {} : { controlKernelTaskPacketAttempts }),
+    }
   }
   if (value.version === 2) {
     const workspaces: Record<string, PersistedWorkspaceState> = {}
@@ -95,6 +115,60 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
     return { version: 3, workspaces }
   }
   throw invalidDocument()
+}
+
+const validateControlKernelTaskPacketBindings = (
+  workspaces: Record<string, PersistedWorkspaceState>,
+  attempts: Record<string, ControlKernelTaskPacketAttempt> | undefined,
+): void => {
+  const taskStates: Array<{ workspace: PersistedWorkspaceState, task: ControlKernelTaskPacketState }> = []
+  for (const workspace of Object.values(workspaces)) {
+    for (const task of Object.values(workspace.controlKernelTaskPackets ?? {})) {
+      taskStates.push({ workspace, task })
+      const attempt = attempts?.[task.attemptId]
+      const lifecycle = workspace.dispatchLifecycles[task.lifecycleKey]
+      if (
+        !attempt ||
+        !sameControlKernelTaskPacket(attempt.packet, task) ||
+        attempt.lifecycleKey !== task.lifecycleKey ||
+        !lifecycle?.lease ||
+        lifecycle.migrationAliasOf !== undefined ||
+        lifecycle.lease.owner !== attempt.owner ||
+        lifecycle.lease.epoch !== task.generation ||
+        !controlKernelPhaseMatchesReceipts(task, attempt) ||
+        (task.phase === 'complete') !== (lifecycle.phase === 'complete')
+      ) throw invalidDocument()
+    }
+  }
+  for (const attempt of Object.values(attempts ?? {})) {
+    if (!taskStates.some(({ task }) =>
+      task.issueId === attempt.packet.issueId &&
+      task.taskId === attempt.packet.taskId &&
+      task.inputRevision === attempt.packet.inputRevision &&
+      task.lifecycleKey === attempt.lifecycleKey &&
+      attempt.packet.generation <= task.generation
+    )) throw invalidDocument()
+  }
+}
+
+const sameControlKernelTaskPacket = (
+  left: ControlKernelTaskPacket,
+  right: ControlKernelTaskPacket,
+): boolean => left.issueId === right.issueId &&
+  left.taskId === right.taskId &&
+  left.inputRevision === right.inputRevision &&
+  left.attemptId === right.attemptId &&
+  left.generation === right.generation
+
+const controlKernelPhaseMatchesReceipts = (
+  task: ControlKernelTaskPacketState,
+  attempt: ControlKernelTaskPacketAttempt,
+): boolean => {
+  const hasCheckpoint = attempt.receipts.checkpoint !== undefined
+  const hasComplete = attempt.receipts.complete !== undefined
+  if (task.phase === 'claimed') return !hasCheckpoint && !hasComplete
+  if (task.phase === 'checkpointed') return hasCheckpoint && !hasComplete
+  return hasCheckpoint && hasComplete
 }
 
 export const emptyDiscoverySweepState = (): DiscoverySweepState => ({
